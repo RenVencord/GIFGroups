@@ -262,7 +262,7 @@ function gifItemFromChatCtxArgs(args: any[]): GifItem | null {
     if (!item) return null;
     const src = item.src ?? item.url ?? item.href;
     if (!src) return null;
-    return {
+    const result = {
         url: item.url ?? src,
         src,
         gifSrc: item.gifSrc,
@@ -270,6 +270,9 @@ function gifItemFromChatCtxArgs(args: any[]): GifItem | null {
         height: item.height ?? 100,
         format: item.contentType?.includes("video") ? "VIDEO" : "IMAGE",
     };
+    console.log("[GIFGroups] raw item from ctx:", JSON.stringify(item));
+    console.log("[GIFGroups] gifItemFromChatCtxArgs result:", JSON.stringify(result));
+    return result;
 }
 
 const chatGifMenuPatch: NavContextMenuPatchCallback = (children, ...args) => {
@@ -403,7 +406,9 @@ export default definePlugin({
 
     // newest first
     getGroupGifs(rt: string): GifItem[] {
-        return [...(groupFromRt(rt)?.gifs ?? [])].reverse();
+        const gifs = [...(groupFromRt(rt)?.gifs ?? [])].reverse();
+        console.log("[GIFGroups] getGroupGifs for", rt, "returning", gifs.length, "items:", JSON.stringify(gifs));
+        return gifs;
     },
 
     groupHeaderContent(rt: string, color: string) {
