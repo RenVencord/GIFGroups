@@ -1,9 +1,22 @@
 import * as DataStore from "@api/DataStore";
 import { addContextMenuPatch, removeContextMenuPatch } from "@api/ContextMenu";
+import { Flex } from "@components/Flex";
 import { Devs } from "@utils/constants";
 import definePlugin from "@utils/types";
-import { ConfirmModal, ContextMenuApi, FluxDispatcher, Menu, React, Text, openModal, useState } from "@webpack/common";
+import { chooseFile, saveFile } from "@utils/web";
+import { findByPropsLazy } from "@webpack";
+import { Button, ConfirmModal, ContextMenuApi, FluxDispatcher, Menu, React, Text, openModal, showToast, useState } from "@webpack/common";
 import type { NavContextMenuPatchCallback } from "@api/ContextMenu";
+
+const GIFMediaTypes = findByPropsLazy("TL");
+
+const getFormat = (isVid: boolean): any => {
+    const TL = GIFMediaTypes?.TL;
+    if (TL) {
+        return isVid ? TL.VIDEO : TL.IMAGE;
+    }
+    return isVid ? 2 : 1;
+};
 
 
 interface GifItem {
@@ -85,8 +98,33 @@ const deleteGroup = async (groupId: string) => {
 const addToGroup = async (groupId: string, gif: GifItem) => {
     const g = groups[groupId];
     if (!g) return;
-    if (!g.gifs.some(x => gifKey(x) === gifKey(gif))) {
-        g.gifs.push(gif);
+
+    let src = gif.src || gif.url || FALLBACK_SRC;
+    if (typeof src === "string" && src.startsWith("//")) src = "https:" + src;
+
+    let url = gif.url || src;
+    if (typeof url === "string" && url.startsWith("//")) url = "https:" + url;
+
+    let gifSrc = gif.gifSrc;
+    if (typeof gifSrc === "string" && gifSrc.startsWith("//")) gifSrc = "https:" + gifSrc;
+
+    const isVid = (gif.format as any) === "VIDEO" || (gif.format as any) === 2 ||
+        (typeof src === "string" && (src.includes(".webm") || src.includes(".mp4")));
+
+    const format = getFormat(isVid);
+
+    const normalizedGif: GifItem = {
+        id: gif.id || genId(),
+        src,
+        url,
+        gifSrc,
+        width: typeof gif.width === "number" && gif.width > 0 ? gif.width : (Number(gif.width) > 0 ? Number(gif.width) : 200),
+        height: typeof gif.height === "number" && gif.height > 0 ? gif.height : (Number(gif.height) > 0 ? Number(gif.height) : 200),
+        format,
+    };
+
+    if (!g.gifs.some(x => gifKey(x) === gifKey(normalizedGif))) {
+        g.gifs.push(normalizedGif);
         await saveGroups();
         notifyGroupChange();
     }
@@ -114,6 +152,96 @@ const groupFromRt = (rt: string): GifGroup | null =>
     rt?.startsWith(GROUP_PREFIX)
         ? (groups[rt.slice(GROUP_PREFIX.length)] ?? null)
         : null;
+
+
+const exportGroups = async () => {
+    try {
+        const data = JSON.stringify({ groups, groupOrder }, null, 2);
+        const filename = `gif-groups-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        if (typeof IS_DISCORD_DESKTOP !== "undefined" && IS_DISCORD_DESKTOP && typeof DiscordNative !== "undefined" && DiscordNative?.fileManager?.saveWithDialog) {
+            const encoded = new TextEncoder().encode(data);
+            await DiscordNative.fileManager.saveWithDialog(encoded, filename);
+        } else {
+            saveFile(new File([data], filename, { type: "application/json" }));
+        }
+        showToast({ text: "Successfully exported GIF groups!", variant: "success" });
+    } catch (err: any) {
+        showToast({ text: `Failed to export GIF groups: ${err?.message ?? err}`, variant: "critical" });
+    }
+};
+
+const importGroups = async () => {
+    try {
+        let fileContent = "";
+        if (typeof IS_DISCORD_DESKTOP !== "undefined" && IS_DISCORD_DESKTOP && typeof DiscordNative !== "undefined" && DiscordNative?.fileManager?.openFiles) {
+            const [file] = await DiscordNative.fileManager.openFiles({
+                filters: [
+                    { name: "GIF Groups Backup", extensions: ["json"] },
+                    { name: "All Files", extensions: ["*"] }
+                ]
+            });
+            if (!file) return;
+            fileContent = new TextDecoder().decode(file.data);
+        } else {
+            const file = await chooseFile("application/json");
+            if (!file) return;
+            fileContent = await file.text();
+        }
+
+        const parsed = JSON.parse(fileContent);
+        if (!parsed || typeof parsed !== "object") {
+            throw new Error("Invalid backup format");
+        }
+
+        let importedGroups: Record<string, GifGroup> = {};
+        let importedOrder: string[] = [];
+
+        if (parsed.groups && typeof parsed.groups === "object" && !Array.isArray(parsed.groups)) {
+            importedGroups = parsed.groups;
+            importedOrder = Array.isArray(parsed.groupOrder) ? parsed.groupOrder : Object.keys(importedGroups);
+        } else if (Array.isArray(parsed.groups)) {
+            for (const g of parsed.groups) {
+                if (g && typeof g === "object" && g.id) {
+                    importedGroups[g.id] = g;
+                }
+            }
+            importedOrder = Array.isArray(parsed.groupOrder) ? parsed.groupOrder : parsed.groups.map((g: any) => g.id).filter(Boolean);
+        } else if (Array.isArray(parsed)) {
+            for (const g of parsed) {
+                if (g && typeof g === "object" && g.id) {
+                    importedGroups[g.id] = g;
+                }
+            }
+            importedOrder = parsed.map((g: any) => g.id).filter(Boolean);
+        } else {
+            const keys = Object.keys(parsed).filter(k => k !== "groupOrder");
+            if (keys.length > 0 && typeof parsed[keys[0]] === "object" && parsed[keys[0]].gifs) {
+                importedGroups = parsed;
+                importedOrder = Array.isArray(parsed.groupOrder) ? parsed.groupOrder : keys;
+            } else {
+                throw new Error("Unrecognized GIF groups backup format");
+            }
+        }
+
+        for (const [id, group] of Object.entries(importedGroups)) {
+            if (!group || typeof group !== "object" || typeof group.name !== "string" || !Array.isArray(group.gifs)) {
+                throw new Error(`Invalid group structure in group "${id}"`);
+            }
+        }
+
+        groups = importedGroups;
+        groupOrder = importedOrder.filter(id => id in groups);
+        for (const id of Object.keys(groups)) {
+            if (!groupOrder.includes(id)) groupOrder.push(id);
+        }
+
+        await saveGroups();
+        notifyGroupChange();
+        showToast({ text: "Successfully imported GIF groups!", variant: "success" });
+    } catch (err: any) {
+        showToast({ text: `Failed to import GIF groups: ${err?.message ?? err}`, variant: "critical" });
+    }
+};
 
 
 function NameModal({
@@ -260,15 +388,28 @@ function buildGroupTileMenu(group: GifGroup) {
 function gifItemFromChatCtxArgs(args: any[]): GifItem | null {
     const item = args[0];
     if (!item) return null;
-    const src = item.src ?? item.url ?? item.href;
+    let src = item.src ?? item.url ?? item.href;
     if (!src) return null;
+    if (typeof src === "string" && src.startsWith("//")) src = "https:" + src;
+
+    let url = item.url ?? src;
+    if (typeof url === "string" && url.startsWith("//")) url = "https:" + url;
+
+    let gifSrc = item.gifSrc;
+    if (typeof gifSrc === "string" && gifSrc.startsWith("//")) gifSrc = "https:" + gifSrc;
+
+    const isVid = item.contentType?.includes("video") || (item.format as any) === "VIDEO" || item.format === 2 ||
+        (typeof src === "string" && (src.includes(".webm") || src.includes(".mp4")));
+
+    const format = getFormat(isVid);
+
     const result = {
-        url: item.url ?? src,
+        url,
         src,
-        gifSrc: item.gifSrc,
-        width: item.width ?? 100,
-        height: item.height ?? 100,
-        format: item.contentType?.includes("video") ? "VIDEO" : "IMAGE",
+        gifSrc,
+        width: typeof item.width === "number" && item.width > 0 ? item.width : (Number(item.width) > 0 ? Number(item.width) : 200),
+        height: typeof item.height === "number" && item.height > 0 ? item.height : (Number(item.height) > 0 ? Number(item.height) : 200),
+        format,
     };
     console.log("[GIFGroups] raw item from ctx:", JSON.stringify(item));
     console.log("[GIFGroups] gifItemFromChatCtxArgs result:", JSON.stringify(result));
@@ -324,6 +465,17 @@ export default definePlugin({
         removeContextMenuPatch(["image-menu", "image-context"], chatGifMenuPatch);
     },
 
+    settingsAboutComponent: () => (
+        <Flex gap="1em">
+            <Button onClick={exportGroups}>
+                Export Groups
+            </Button>
+            <Button color={Button.Colors.PRIMARY} onClick={importGroups}>
+                Import Groups
+            </Button>
+        </Flex>
+    ),
+
     // ── Methods called from patches ──────────────────────────────────────
 
     onGifContextMenu(event: MouseEvent, item: any) {
@@ -374,6 +526,14 @@ export default definePlugin({
         await reorderGroup(fromId, toId);
     },
 
+    get groups() {
+        return groups;
+    },
+
+    get groupOrder() {
+        return groupOrder;
+    },
+
     // React hook — called inside j() (the category grid wrapper) via patch 2a.
     // Subscribes the component to group mutations so it re-renders live.
     useGroupTiles() {
@@ -387,15 +547,22 @@ export default definePlugin({
 
     buildGroupTiles(): object[] {
         return orderedGroups().map(g => {
-            // pick a random GIF from the group as the thumbnail
             const gif = g.gifs.length
                 ? g.gifs[Math.floor(Math.random() * g.gifs.length)]
                 : null;
+            let src = gif?.src ?? FALLBACK_SRC;
+            if (typeof src === "string" && src.startsWith("//")) src = "https:" + src;
+
+            const isVid = (gif?.format as any) === "VIDEO" || (gif?.format as any) === 2 ||
+                (typeof src === "string" && (src.includes(".webm") || src.includes(".mp4")));
+
+            const format = getFormat(isVid);
+
             return {
                 type: `${GROUP_PREFIX}${g.id}`,
                 name: g.name,
-                src: gif?.src ?? FALLBACK_SRC,
-                format: gif?.format ?? "IMAGE",
+                src,
+                format,
             };
         });
     },
@@ -406,7 +573,33 @@ export default definePlugin({
 
     // newest first
     getGroupGifs(rt: string): GifItem[] {
-        const gifs = [...(groupFromRt(rt)?.gifs ?? [])].reverse();
+        const rawGifs = groupFromRt(rt)?.gifs ?? [];
+        const gifs = [...rawGifs].reverse().map(g => {
+            let src = g.src || g.url || FALLBACK_SRC;
+            if (typeof src === "string" && src.startsWith("//")) src = "https:" + src;
+
+            let url = g.url || src;
+            if (typeof url === "string" && url.startsWith("//")) url = "https:" + url;
+
+            let gifSrc = g.gifSrc;
+            if (typeof gifSrc === "string" && gifSrc.startsWith("//")) gifSrc = "https:" + gifSrc;
+
+            const isVid = (g.format as any) === "VIDEO" || (g.format as any) === 2 ||
+                (typeof src === "string" && (src.includes(".webm") || src.includes(".mp4")));
+
+            const format = getFormat(isVid);
+
+            return {
+                ...g,
+                id: g.id || gifKey(g),
+                src,
+                url,
+                gifSrc,
+                width: typeof g.width === "number" && g.width > 0 ? g.width : (Number(g.width) > 0 ? Number(g.width) : 200),
+                height: typeof g.height === "number" && g.height > 0 ? g.height : (Number(g.height) > 0 ? Number(g.height) : 200),
+                format,
+            };
+        });
         console.log("[GIFGroups] getGroupGifs for", rt, "returning", gifs.length, "items:", JSON.stringify(gifs));
         return gifs;
     },
@@ -437,7 +630,7 @@ export default definePlugin({
                     replace: "trendingCategories:[...$self.useGroupTiles(),...$1],favorites:",
                 },
                 {
-                    match: /data:(\i)(===(?:\i\.){2}FAVORITES)\?/,
+                    match: /data:(\i)(===(?:\i\.)+FAVORITES)\?/,
                     replace: "data:$self.isGroupRt($1)?$self.getGroupGifs($1):$1$2?",
                 },
                 {
